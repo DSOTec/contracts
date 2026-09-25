@@ -9,18 +9,22 @@ permissions:
   contents: write
   id-token: write # Required for keyless signing with cosign
 
+# Reviewed toolchain pins. Bump them only through the process in SUPPLY_CHAIN.md.
+env:
+  COSIGN_VERSION: 'v2.2.4'
+
 jobs:
   build-and-attest:
     name: Build, Attest, and Publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Get Commit Hash
         id: vars
@@ -31,25 +35,23 @@ jobs:
           docker build \
             --build-arg COMMIT_HASH=${{ steps.vars.outputs.commit }} \
             -t stellar-attestation-builder \
-            -f contracts/stellar/build/Dockerfile .
+            -f stellar/build/Dockerfile .
 
+      # attestation.json records the commit, the WASM hashes and the full
+      # toolchain (rustc, cargo, rustup, stellar-cli, soroban-sdk, base image
+      # digest, Cargo.lock hash) used to produce this release.
       - name: Run Build and Generate Attestation
         run: |
-          # Run the container to build and output the attestation.json
-          # We mount a local directory to capture the output file.
-          mkdir -p output
-          docker run --rm -v $(pwd)/output:/workspace/contracts/stellar/build/output stellar-attestation-builder > output/attestation.json
-          # The script echo's the attestation.json to stdout at the end, so we can capture it,
-          # or we can modify the run command to copy it out. Wait, the build.sh currently
-          # outputs to contracts/stellar/build/attestation.json inside the container.
-          # Let's extract it using a docker cp.
           docker create --name builder stellar-attestation-builder
           docker start -a builder
-          docker cp builder:/workspace/contracts/stellar/build/attestation.json ./attestation.json
+          docker cp builder:/workspace/stellar/build/attestation.json ./attestation.json
           docker rm builder
+          jq .toolchain attestation.json
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3.5.0
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
 
       - name: Sign Attestation
         run: |
@@ -57,7 +59,7 @@ jobs:
           cosign sign-blob --yes --output-signature attestation.json.sig --output-certificate attestation.json.crt attestation.json
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             attestation.json
