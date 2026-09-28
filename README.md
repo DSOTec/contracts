@@ -191,11 +191,11 @@ CI actions, toolchains, base images and lockfile sources are pinned and checked 
 
 | Contract | Address |
 |---|---|
-| ERC5564Announcer | TBD |
-| ERC6538Registry | TBD |
-| WraithSender | TBD |
-| WraithNames | TBD |
-| WraithWithdrawer | TBD |
+| ERC5564Announcer | `0x8AE65c05E7eb48B9bA652781Bc0a3DBA09A484F3` |
+| ERC6538Registry | `0x953E6cEdcdfAe321796e7637d33653F6Ce05c527` |
+| WraithSender | Not yet deployed |
+| WraithNames | Not yet deployed |
+| WraithWithdrawer | Not yet deployed |
 
 ### Stellar Testnet
 

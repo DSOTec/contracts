@@ -69,6 +69,7 @@ jobs:
       - run: npx prettier --check --ignore-path ../.prettierignore .
       - run: npx hardhat compile
       - run: npx hardhat test
+      - run: npm run validate-subgraph
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
@@ -99,7 +100,7 @@ jobs:
           sarif: evm/results.sarif
 
       - name: Upload Slither SARIF
-        if: always()
+        if: always() && hashFiles('evm/results.sarif') != ''
         uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           sarif_file: evm/results.sarif
