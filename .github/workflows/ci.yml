@@ -16,9 +16,10 @@ env:
   RUST_NIGHTLY_TOOLCHAIN: 'nightly-2026-09-01'
   NODE_VERSION: '22.23.2'
   PNPM_VERSION: '10.28.2'
-  STELLAR_CLI_VERSION: '22.0.1'
-  # sha256 of stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz
-  STELLAR_CLI_SHA256: '02cb00cf57ce8f432e0cc1653a1b603353a97079c22a8370dac60c21eca18fe3'
+  STELLAR_CLI_VERSION: '26.1.0'
+  # sha256 of stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz,
+  # as published by the upstream release.
+  STELLAR_CLI_SHA256: 'e18d5a7629102e1ccc07241acbcbebfc05b1c02476ce7d3204ba2d7418be5c0c'
   FOUNDRY_VERSION: 'v1.8.3'
   SLITHER_VERSION: '0.11.4'
   KANI_VERSION: '0.68.0'
@@ -101,7 +102,7 @@ jobs:
 
       - name: Upload Slither SARIF
         if: always() && hashFiles('evm/results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: evm/results.sarif
           category: slither
@@ -157,7 +158,7 @@ jobs:
           sudo ln -sf /usr/local/bin/stellar /usr/local/bin/soroban
           stellar --version
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
@@ -233,24 +234,26 @@ jobs:
           path: |
             stellar/bench/data/crossover.csv
             stellar/bench/data/crossover-chart.md
-      # WASM build depends on soroban-sdk 22.0.11 compiling under current
-      # stable rustc, which fails with 162 unresolved-import errors in the
-      # SDK's transitive deps. This is a soroban-sdk 22.0.11 bug fixed in
-      # 23.x/27.x — bumping is a major API migration owned separately.
-      # Keep the step visible but non-blocking so it doesn't gate wave PRs.
-      - name: Build WASM (soroban-sdk 22 vs current rustc; non-blocking)
-        continue-on-error: true
+      # The 162 errors this step used to produce were not a soroban-sdk/rustc
+      # incompatibility: a plain `cargo build` in a virtual workspace selects
+      # every member, and bench, bench-crossover and integration-tests enable
+      # soroban-sdk/testutils, which the SDK refuses to compile for wasm32.
+      # default-members in stellar/Cargo.toml limits the default build to the
+      # contract crates. See SUPPLY_CHAIN.md for the pins and upgrade path.
+      - name: Build WASM
         run: cargo build --target wasm32-unknown-unknown --release
       - name: Optimize and Check WASM Size
-        continue-on-error: true
         run: |
-          if ! ls target/wasm32-unknown-unknown/release/*.wasm > /dev/null 2>&1; then
-            echo "No WASM artifacts (build step above did not produce output); skipping optimize."
-            exit 0
+          shopt -s nullglob
+          artifacts=(target/wasm32-unknown-unknown/release/*.wasm)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "Error: the WASM build produced no artifacts."
+            exit 1
           fi
-          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
-            soroban contract optimize --wasm "$wasm"
-            opt_wasm="${wasm%.*}_optimized.wasm"
+          for wasm in "${artifacts[@]}"; do
+            stellar contract optimize --wasm "$wasm"
+            # `contract optimize` writes "<name>.optimized.wasm" beside the input.
+            opt_wasm="${wasm%.wasm}.optimized.wasm"
             SIZE=$(stat -c%s "$opt_wasm")
             echo "$opt_wasm size is $SIZE bytes"
             if [ "$SIZE" -gt 112640 ]; then
@@ -262,30 +265,33 @@ jobs:
       - name: Run Upgrade Authority Enforcement Tests
         run: cargo test upgrade_auth --workspace
 
-      # Bindings depend on a successful workspace WASM build (currently
-      # non-blocking; see the note on the Build WASM step). Mark this
-      # non-blocking too so bindings-drift detection doesn't spuriously
-      # fail wave PRs.
       - name: Generate Stellar TypeScript bindings
-        id: bindings
-        continue-on-error: true
         run: pnpm bindings:stellar
         working-directory: .
 
+      # Scoped to the generated artifacts: `cargo test --workspace` earlier in
+      # this job rewrites soroban test_snapshots, and that churn must not be
+      # attributed to the bindings.
       - name: Check for bindings drift (diff detection)
-        if: steps.bindings.outcome == 'success'
-        run: git diff --exit-code
         working-directory: .
-      # ABI extraction depends on the same soroban-sdk 22 WASM build as above.
-      # When the SDK bump (23.x/27.x) lands, remove continue-on-error to
-      # enforce ABI snapshot freshness on every PR.
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all -- stellar/bindings)" ]; then
+            git --no-pager status --short --untracked-files=all -- stellar/bindings
+            git --no-pager diff -- stellar/bindings
+            echo "Error: Stellar bindings are out of date. Run pnpm bindings:stellar and commit the result."
+            exit 1
+          fi
+
       - name: Extract ABI snapshots
-        id: abi
-        continue-on-error: true
         run: ./abi/update.sh
       - name: Check ABI snapshots
-        if: steps.abi.outcome == 'success'
-        run: git diff --exit-code abi/
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all -- abi/)" ]; then
+            git --no-pager status --short --untracked-files=all -- abi/
+            git --no-pager diff --stat -- abi/
+            echo "Error: ABI snapshots are out of date. Run stellar/abi/update.sh and commit the result."
+            exit 1
+          fi
 
   stellar-kani:
     needs: changes
@@ -295,7 +301,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -319,7 +325,7 @@ jobs:
         working-directory: stellar
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
@@ -338,7 +344,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
@@ -403,7 +409,7 @@ jobs:
       WRAITHCHAOS_SEED: "42"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Run chaos integration tests
@@ -427,7 +433,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -468,7 +474,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -477,7 +483,7 @@ jobs:
 
       - name: Download weekly baseline artifact
         id: download-baseline
-        uses: dawidd6/action-download-artifact@d63b86af1b34672e53c440b1b83979861906bad7 # v24
+        uses: dawidd6/action-download-artifact@eab87c9830c39eff17e5a6eadb20bfb4bc880477 # v27
         continue-on-error: true
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -537,7 +543,7 @@ jobs:
           ref: develop
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -573,7 +579,7 @@ jobs:
         working-directory: solana
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: '1.91.0'
       - uses: heyAyushh/setup-anchor@0dfcdd252cd9716ef398947d2b765369c9f3a6de # v4.999
@@ -592,12 +598,26 @@ jobs:
         working-directory: ckb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: riscv64imac-unknown-none-elf
       - run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-unknown-elf
       - run: CC_riscv64imac_unknown_none_elf=riscv64-unknown-elf-gcc cargo build --target riscv64imac-unknown-none-elf --release -p wraith-stealth-lock
+      # Transaction-level tests (#195): run the compiled RISC-V artifact inside
+      # ckb-testtool's in-process simulator. Covers signature/argument validation,
+      # malformed cells, amount checks, the produced code hash, and writes a
+      # CKB-debugger-replayable fixture for every failing transaction.
+      - name: Run CKB lock-script integration tests
+        run: make test-ci
+      - name: Upload CKB transaction fixtures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ckb-transaction-fixtures
+          path: ckb/target/ckb-fixtures/
+          if-no-files-found: ignore
+          retention-days: 14
 
   fuzz:
     # Nightly cargo-fuzz run against stealth-sender's batch payload surface.
@@ -609,7 +629,7 @@ jobs:
         working-directory: stellar/stealth-sender/fuzz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
       - name: Install cargo-fuzz
@@ -645,7 +665,7 @@ jobs:
         working-directory: evm/subgraph
       - run: npm run test -- conformance
         working-directory: evm/subgraph
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo test --package integration-tests --test conformance
