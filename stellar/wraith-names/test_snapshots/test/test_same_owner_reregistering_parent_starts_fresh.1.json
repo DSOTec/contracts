@@ -182,9 +182,7 @@
                       "key": {
                         "symbol": "era"
                       },
-                      "val": {
-                        "u32": 856241466
-                      }
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -267,7 +265,7 @@
                         "symbol": "era"
                       },
                       "val": {
-                        "u32": 856241466
+                        "u64": 1
                       }
                     },
                     {
@@ -393,6 +391,51 @@
                 "durability": "persistent",
                 "val": {
                   "bytes": "67b61ed328e558ee1fb5f308366538f39de685dc6aa40dc83cf151260aafcb11"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "SubdomainEra"
+                },
+                {
+                  "bytes": "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "SubdomainEra"
+                    },
+                    {
+                      "bytes": "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u64": 1
                 }
               }
             },

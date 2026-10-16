@@ -138,9 +138,7 @@
                       "key": {
                         "symbol": "era"
                       },
-                      "val": {
-                        "u32": 2615299666
-                      }
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -223,7 +221,7 @@
                         "symbol": "era"
                       },
                       "val": {
-                        "u32": 2615299666
+                        "u64": 0
                       }
                     },
                     {
@@ -309,7 +307,7 @@
                         "symbol": "era"
                       },
                       "val": {
-                        "u32": 2615299666
+                        "u64": 0
                       }
                     },
                     {
@@ -435,6 +433,51 @@
                 "durability": "persistent",
                 "val": {
                   "bytes": "3befd9118d9a7b7aa9f836a2badf5745146fa974986900db5cb2f2eeda67f4c9"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "SubdomainEra"
+                },
+                {
+                  "bytes": "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "SubdomainEra"
+                    },
+                    {
+                      "bytes": "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u64": 0
                 }
               }
             },

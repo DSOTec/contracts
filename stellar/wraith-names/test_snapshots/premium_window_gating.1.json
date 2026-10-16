@@ -255,7 +255,7 @@
                         "symbol": "era"
                       },
                       "val": {
-                        "u32": 2615299666
+                        "u64": 0
                       }
                     },
                     {
@@ -340,9 +340,7 @@
                       "key": {
                         "symbol": "era"
                       },
-                      "val": {
-                        "u32": 856241466
-                      }
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -424,9 +422,7 @@
                       "key": {
                         "symbol": "era"
                       },
-                      "val": {
-                        "u32": 2615299666
-                      }
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -594,6 +590,51 @@
                 "durability": "persistent",
                 "val": {
                   "bytes": "ff06535ac1029cca2fc2b86ac7355a7b4e0b8d839fc76b51d30833f4e1347ddc"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "SubdomainEra"
+                },
+                {
+                  "bytes": "ff06535ac1029cca2fc2b86ac7355a7b4e0b8d839fc76b51d30833f4e1347ddc"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "SubdomainEra"
+                    },
+                    {
+                      "bytes": "ff06535ac1029cca2fc2b86ac7355a7b4e0b8d839fc76b51d30833f4e1347ddc"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u64": 0
                 }
               }
             },

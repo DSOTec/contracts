@@ -51,6 +51,10 @@ pub enum DataKey {
     PendingRotation,
     /// Pending auction-admin rotation proposal, if any.
     PendingAuctionAdminRotation,
+    /// Subdomain era of a top-level name (see `NameEntry::era`): created at 0
+    /// when the name gets its first subdomain and incremented every time the
+    /// name is released. It only ever increases, so an era is never reused.
+    SubdomainEra(BytesN<32>),
 }
 
 /// A registered name entry.
@@ -64,14 +68,12 @@ pub struct NameEntry {
     /// `None` for a flat top-level name. Existing flat names register with
     /// `None`, so prior behaviour is preserved.
     pub parent: Option<BytesN<32>>,
-    /// Identifies one registration of a top-level name: a random 32-bit value
-    /// drawn each time the name is registered. A subdomain records the era of
-    /// the parent registration it was created under and is live only while the
-    /// parent still carries it, so releasing (or releasing and re-registering)
-    /// a parent retires every subdomain created under it.
-    ///
-    /// Kept to a short key and a `u32` because every entry stores it.
-    pub era: u32,
+    /// For a subdomain, the parent's `SubdomainEra` when the subdomain was
+    /// registered; `None` for a top-level name. The subdomain is live only
+    /// while the parent's era is unchanged: releasing the parent advances it,
+    /// so every subdomain registered before the release is retired for good,
+    /// even if the parent is registered again.
+    pub era: Option<u64>,
 }
 
 /// Guardian configuration for a name.
@@ -606,8 +608,7 @@ impl WraithNamesContract {
         }
 
         // Subdomains require an existing parent and that `owner` is the parent
-        // owner. They inherit the parent registration's era; top-level names
-        // start a new one.
+        // owner. They record the parent's current subdomain era.
         let era = match parent_hash {
             Some(ref ph) => {
                 let parent: NameEntry = env
@@ -618,9 +619,12 @@ impl WraithNamesContract {
                 if parent.owner != owner {
                     return Err(NamesError::NotOwner);
                 }
-                parent.era
+                Some(Self::subdomain_era(env, ph).unwrap_or_else(|| {
+                    Self::set_subdomain_era(env, ph, 0);
+                    0
+                }))
             }
-            None => Self::new_era(env),
+            None => None,
         };
 
         let entry = NameEntry {
@@ -735,6 +739,15 @@ impl WraithNamesContract {
         // Remove name
         env.storage().persistent().remove(&name_key);
 
+        // Retire every subdomain registered under this name. Names that never
+        // had a subdomain have no era to advance.
+        if entry.parent.is_none() {
+            if let Some(era) = Self::subdomain_era(env, &name_hash) {
+                let next = era.checked_add(1).expect("subdomain era overflow");
+                Self::set_subdomain_era(env, &name_hash, next);
+            }
+        }
+
         env.events()
             .publish((symbol_short!("release"), name_hash), name);
 
@@ -766,10 +779,11 @@ impl WraithNamesContract {
         }
     }
 
-    /// The parent of a subdomain, if it is still live: it must exist and carry
-    /// the era the subdomain was registered under. Top-level names have
-    /// no parent (`Ok(None)`). A subdomain whose parent was released, or
-    /// released and registered again, is dead and reports `NameNotFound`.
+    /// The parent of a subdomain, if it is still live: it must exist and its
+    /// subdomain era must still be the one the subdomain was registered under.
+    /// Top-level names have no parent (`Ok(None)`). A subdomain whose parent
+    /// was released, or released and registered again, is dead and reports
+    /// `NameNotFound`; eras never repeat, so it cannot come back.
     ///
     /// If the parent's entry has expired (been archived), reading it fails: a
     /// subdomain cannot be used while its parent is archived.
@@ -777,14 +791,27 @@ impl WraithNamesContract {
         let Some(ref parent_hash) = entry.parent else {
             return Ok(None);
         };
-        match env
+        let parent = env
             .storage()
             .persistent()
             .get::<_, NameEntry>(&DataKey::Name(parent_hash.clone()))
-        {
-            Some(parent) if parent.era == entry.era => Ok(Some(parent)),
-            _ => Err(NamesError::NameNotFound),
+            .ok_or(NamesError::NameNotFound)?;
+        if entry.era.is_none() || Self::subdomain_era(env, parent_hash) != entry.era {
+            return Err(NamesError::NameNotFound);
         }
+        Ok(Some(parent))
+    }
+
+    fn subdomain_era(env: &Env, parent_hash: &BytesN<32>) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SubdomainEra(parent_hash.clone()))
+    }
+
+    fn set_subdomain_era(env: &Env, parent_hash: &BytesN<32>, era: u64) {
+        let key = DataKey::SubdomainEra(parent_hash.clone());
+        env.storage().persistent().set(&key, &era);
+        Self::extend_ttls(env, &key, None);
     }
 
     /// Whether `name_key` holds a live name (a dead subdomain does not count).
@@ -793,15 +820,6 @@ impl WraithNamesContract {
             .persistent()
             .get::<_, NameEntry>(name_key)
             .is_some_and(|existing| Self::live_parent(env, &existing).is_ok())
-    }
-
-    /// A new era for a top-level registration. Random rather than a counter so
-    /// that registering does not write instance storage, which every call
-    /// loads. A re-registration repeats a previous era with probability 2^-32,
-    /// and even then the revived subdomains are controlled only by the parent's
-    /// new owner.
-    fn new_era(env: &Env) -> u32 {
-        env.prng().gen::<u64>() as u32
     }
 
     /// Remove the reverse entry for `meta` if it still points at `name_hash`.
@@ -889,6 +907,7 @@ impl WraithNamesContract {
         Self::extend_ttls(&env, &name_key, None);
         if let Some(ref parent_hash) = entry.parent {
             Self::extend_ttls(&env, &DataKey::Name(parent_hash.clone()), None);
+            Self::extend_ttls(&env, &DataKey::SubdomainEra(parent_hash.clone()), None);
         }
 
         // Emit metric event.
@@ -1003,11 +1022,13 @@ impl WraithNamesContract {
         }
     }
 
-    /// Extend a subdomain's parent entry (and its reverse entry) to `to`.
+    /// Extend a subdomain's parent entry, its reverse entry and its subdomain
+    /// era to `to`.
     fn extend_parent_to(env: &Env, entry: &NameEntry, parent: &NameEntry, current: u32, to: u32) {
         let storage = env.storage().persistent();
         if let Some(ref parent_hash) = entry.parent {
             storage.extend_ttl(&DataKey::Name(parent_hash.clone()), current, to);
+            storage.extend_ttl(&DataKey::SubdomainEra(parent_hash.clone()), current, to);
         }
         let reverse_key = DataKey::Reverse(BytesN::from_array(
             env,
@@ -2045,6 +2066,133 @@ mod test {
         );
         client.release(&new_owner, &sub);
         assert_eq!(client.try_resolve(&sub), Err(Ok(NamesError::NameNotFound)));
+    }
+
+    fn subdomain_era_of(env: &Env, contract_id: &Address, name: &str) -> Option<u64> {
+        env.as_contract(contract_id, || {
+            let hash = WraithNamesContract::hash_name(env, &String::from_str(env, name));
+            env.storage().persistent().get(&DataKey::SubdomainEra(hash))
+        })
+    }
+
+    fn parent_era_of(env: &Env, contract_id: &Address, name: &str) -> u64 {
+        env.as_contract(contract_id, || {
+            let entry: NameEntry = env
+                .storage()
+                .persistent()
+                .get(&name_key(env, name))
+                .unwrap();
+            entry.era.unwrap()
+        })
+    }
+
+    #[test]
+    fn test_subdomain_eras_never_repeat_across_reregistrations() {
+        let (env, client, contract_id) = subdomain_setup();
+        let holders = [Address::generate(&env), Address::generate(&env)];
+        let parent = String::from_str(&env, "alice");
+        let sub = String::from_str(&env, "pay.alice");
+
+        // Release and re-register the parent repeatedly, all in one ledger and
+        // alternating holders: the case a time- or randomness-derived era
+        // could repeat.
+        let mut eras: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for round in 0..5u8 {
+            let holder = &holders[round as usize % 2];
+            client.register(holder, &parent, &meta(&env, 1));
+            client.register(holder, &sub, &meta(&env, 10 + round));
+            assert_eq!(client.resolve(&sub), meta(&env, 10 + round));
+            eras.push(parent_era_of(&env, &contract_id, "pay.alice"));
+            client.release(holder, &parent);
+
+            // Every subdomain registered so far stays retired.
+            assert_eq!(client.try_resolve(&sub), Err(Ok(NamesError::NameNotFound)));
+            for earlier in 0..=round {
+                assert_eq!(
+                    client.try_name_of(&meta(&env, 10 + earlier)),
+                    Err(Ok(NamesError::NameNotFound))
+                );
+            }
+        }
+
+        assert!(
+            eras.windows(2).all(|w| w[0] < w[1]),
+            "eras repeat: {eras:?}"
+        );
+        assert_eq!(subdomain_era_of(&env, &contract_id, "alice"), Some(5));
+    }
+
+    #[test]
+    fn test_stale_subdomain_from_any_earlier_era_cannot_resolve() {
+        let (env, client, contract_id) = subdomain_setup();
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        let parent = String::from_str(&env, "alice");
+        for round in 0..3u8 {
+            client.register(&first, &parent, &meta(&env, 1));
+            client.register(&first, &String::from_str(&env, "pay.alice"), &meta(&env, 2));
+            client.release(&first, &parent);
+            assert_eq!(
+                subdomain_era_of(&env, &contract_id, "alice"),
+                Some(round as u64 + 1)
+            );
+        }
+        client.register(&second, &parent, &meta(&env, 3));
+        let current = subdomain_era_of(&env, &contract_id, "alice").unwrap();
+
+        // Forge a stale subdomain record, with its reverse entry, for every era
+        // issued before the latest release and for an era not yet issued.
+        let team = String::from_str(&env, "team.alice");
+        for (i, era) in (0..current).chain([current + 1, u64::MAX]).enumerate() {
+            let stale_meta = meta(&env, 100 + i as u8);
+            env.as_contract(&contract_id, || {
+                let hash = WraithNamesContract::hash_name(&env, &team);
+                let entry = NameEntry {
+                    name: team.clone(),
+                    stealth_meta_address: stale_meta.clone(),
+                    owner: first.clone(),
+                    parent: Some(WraithNamesContract::hash_name(&env, &parent)),
+                    era: Some(era),
+                };
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Name(hash.clone()), &entry);
+                let meta_hash =
+                    BytesN::from_array(&env, &env.crypto().sha256(&stale_meta).to_array());
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Reverse(meta_hash), &hash);
+            });
+
+            assert_eq!(
+                client.try_resolve(&team),
+                Err(Ok(NamesError::NameNotFound)),
+                "era {era}"
+            );
+            assert_eq!(
+                client.try_name_of(&stale_meta),
+                Err(Ok(NamesError::NameNotFound))
+            );
+            assert_eq!(
+                client.try_update(&second, &team, &meta(&env, 4)),
+                Err(Ok(NamesError::NameNotFound))
+            );
+        }
+
+        // The current holder registers over the stale record; only that resolves.
+        client.register(&second, &team, &meta(&env, 5));
+        assert_eq!(client.resolve(&team), meta(&env, 5));
+        assert_eq!(parent_era_of(&env, &contract_id, "team.alice"), current);
+    }
+
+    #[test]
+    fn test_names_without_subdomains_get_no_era_entry() {
+        let (env, client, contract_id) = subdomain_setup();
+        let owner = Address::generate(&env);
+        let name = String::from_str(&env, "bob");
+        client.register(&owner, &name, &meta(&env, 1));
+        client.release(&owner, &name);
+        assert_eq!(subdomain_era_of(&env, &contract_id, "bob"), None);
     }
 
     #[test]
