@@ -94,6 +94,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "era"
+                      },
+                      "val": {
+                        "u32": 824174546
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "name"
                       },
                       "val": {
@@ -168,6 +176,14 @@
                 "durability": "persistent",
                 "val": {
                   "map": [
+                    {
+                      "key": {
+                        "symbol": "era"
+                      },
+                      "val": {
+                        "u32": 2615299666
+                      }
+                    },
                     {
                       "key": {
                         "symbol": "name"

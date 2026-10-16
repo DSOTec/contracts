@@ -64,6 +64,14 @@ pub struct NameEntry {
     /// `None` for a flat top-level name. Existing flat names register with
     /// `None`, so prior behaviour is preserved.
     pub parent: Option<BytesN<32>>,
+    /// Identifies one registration of a top-level name: a random 32-bit value
+    /// drawn each time the name is registered. A subdomain records the era of
+    /// the parent registration it was created under and is live only while the
+    /// parent still carries it, so releasing (or releasing and re-registering)
+    /// a parent retires every subdomain created under it.
+    ///
+    /// Kept to a short key and a `u32` because every entry stores it.
+    pub era: u32,
 }
 
 /// Guardian configuration for a name.
@@ -303,6 +311,27 @@ impl WraithNamesContract {
         Self::register_internal(&env, owner, name, stealth_meta_address, false)
     }
 
+    /// Register the subdomain `label.parent` (e.g. `payments` under `alice` is
+    /// `payments.alice`), equivalent to `register(owner, "label.parent", ..)`.
+    ///
+    /// `parent` must be a live top-level name and `owner` its current owner.
+    /// `label` follows the usual label rules (3+ lowercase alphanumeric
+    /// characters) and the full name must fit in 32 characters. The subdomain
+    /// is managed by whoever owns `parent` from then on, and is retired when
+    /// `parent` is released.
+    pub fn register_subdomain(
+        env: Env,
+        owner: Address,
+        parent: String,
+        label: String,
+        stealth_meta_address: Bytes,
+    ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
+        owner.require_auth();
+        let name = Self::join_labels(&env, &label, &parent)?;
+        Self::register_internal(&env, owner, name, stealth_meta_address, false)
+    }
+
     /// Register a name on behalf of an owner using a signed authorization.
     pub fn register_on_behalf(
         env: Env,
@@ -431,7 +460,7 @@ impl WraithNamesContract {
                 return Err(NamesError::InvalidMetaAddress);
             }
             let name_hash = Self::hash_name(&env, &name);
-            if env.storage().persistent().has(&DataKey::Name(name_hash)) {
+            if Self::is_taken(&env, &DataKey::Name(name_hash)) {
                 return Err(NamesError::NameTaken);
             }
         }
@@ -485,6 +514,8 @@ impl WraithNamesContract {
             let name_key = DataKey::Name(name_hash.clone());
 
             let entry: NameEntry = env.storage().persistent().get(&name_key).unwrap();
+            // A retired subdomain fails the whole (atomic) batch.
+            let parent = Self::live_parent(&env, &entry)?;
             let meta_hash = BytesN::from_array(
                 &env,
                 &env.crypto().sha256(&entry.stealth_meta_address).to_array(),
@@ -497,6 +528,9 @@ impl WraithNamesContract {
             env.storage()
                 .persistent()
                 .extend_ttl(&reverse_key, current_ledger, extend_to_ledger);
+            if let Some(parent) = parent {
+                Self::extend_parent_to(&env, &entry, &parent, current_ledger, extend_to_ledger);
+            }
 
             env.events()
                 .publish((symbol_short!("extend"), name_hash), extend_to_ledger);
@@ -550,42 +584,11 @@ impl WraithNamesContract {
             return Err(NamesError::InvalidMetaAddress);
         }
 
-        // Parse subdomain
-        let len = name.len() as usize;
-        let mut name_buf = [0u8; MAX_NAME_LEN];
-        name.copy_into_slice(&mut name_buf[..len]);
-
-        let mut dot_count: u32 = 0;
-        let mut last_dot: usize = 0;
-        for i in 0..len {
-            if name_buf[i] == b'.' {
-                dot_count += 1;
-                last_dot = i;
-            }
-        }
-
-        if dot_count > MAX_SUBDOMAIN_DEPTH as u32 {
-            return Err(NamesError::NameTooDeep);
-        }
-
-        let parent_hash = if dot_count > 0 {
-            let mut parent_buf = [0u8; MAX_NAME_LEN];
-            let parent_len = len - last_dot - 1;
-            for i in 0..parent_len {
-                parent_buf[i] = name_buf[last_dot + 1 + i];
-            }
-            let parent_str = String::from_str(
-                env,
-                core::str::from_utf8(&parent_buf[..parent_len]).unwrap(),
-            );
-            let ph = Self::hash_name(env, &parent_str);
-            Some(ph)
-        } else {
-            None
-        };
+        let parent_hash = Self::parent_label(env, &name).map(|p| Self::hash_name(env, &p));
 
         // During the 90-day premium window, top-level names of 4 characters
         // or fewer can only be obtained through the sealed-bid auction.
+        let len = name.len() as usize;
         if !via_auction && parent_hash.is_none() && auction::premium_block_active(env, len) {
             return Err(NamesError::PremiumAuctionRequired);
         }
@@ -593,29 +596,39 @@ impl WraithNamesContract {
         let name_hash = Self::hash_name(env, &name);
         let name_key = DataKey::Name(name_hash.clone());
 
-        // Check not taken
-        if env.storage().persistent().has(&name_key) {
-            return Err(NamesError::NameTaken);
+        // A live name is taken. A subdomain left behind by a released parent is
+        // dead: drop its reverse entry and let the new registration replace it.
+        if let Some(existing) = env.storage().persistent().get::<_, NameEntry>(&name_key) {
+            if Self::live_parent(env, &existing).is_ok() {
+                return Err(NamesError::NameTaken);
+            }
+            Self::clear_reverse(env, &existing.stealth_meta_address, &name_hash);
         }
 
         // Subdomains require an existing parent and that `owner` is the parent
-        // owner.
-        if let Some(ref ph) = parent_hash {
-            let parent: NameEntry = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Name(ph.clone()))
-                .ok_or(NamesError::ParentNotFound)?;
-            if parent.owner != owner {
-                return Err(NamesError::NotOwner);
+        // owner. They inherit the parent registration's era; top-level names
+        // start a new one.
+        let era = match parent_hash {
+            Some(ref ph) => {
+                let parent: NameEntry = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Name(ph.clone()))
+                    .ok_or(NamesError::ParentNotFound)?;
+                if parent.owner != owner {
+                    return Err(NamesError::NotOwner);
+                }
+                parent.era
             }
-        }
+            None => Self::new_era(env),
+        };
 
         let entry = NameEntry {
             name: name.clone(),
             stealth_meta_address: stealth_meta_address.clone(),
             owner,
             parent: parent_hash.clone(),
+            era,
         };
 
         env.storage().persistent().set(&name_key, &entry);
@@ -679,6 +692,7 @@ impl WraithNamesContract {
             stealth_meta_address: new_meta_address.clone(),
             owner,
             parent: entry.parent,
+            era: entry.era,
         };
         env.storage().persistent().set(&name_key, &new_entry);
 
@@ -736,23 +750,74 @@ impl WraithNamesContract {
         Ok(())
     }
 
+    /// Who may update or release `entry`: the owner of a top-level name, or the
+    /// current owner of a subdomain's live parent. Subdomain control is re-read
+    /// from the parent on every call, so it moves with the parent's ownership;
+    /// a subdomain of a released parent is `NameNotFound`.
     fn require_manager(env: &Env, caller: &Address, entry: &NameEntry) -> Result<(), NamesError> {
-        if entry.owner == *caller {
-            return Ok(());
+        let manager = match Self::live_parent(env, entry)? {
+            Some(parent) => parent.owner,
+            None => entry.owner.clone(),
+        };
+        if manager == *caller {
+            Ok(())
+        } else {
+            Err(NamesError::NotOwner)
         }
-        // Check if caller is the parent owner
-        if let Some(ref ph) = entry.parent {
-            if let Some(parent_entry) = env
-                .storage()
-                .persistent()
-                .get::<_, NameEntry>(&DataKey::Name(ph.clone()))
-            {
-                if parent_entry.owner == *caller {
-                    return Ok(());
-                }
-            }
+    }
+
+    /// The parent of a subdomain, if it is still live: it must exist and carry
+    /// the era the subdomain was registered under. Top-level names have
+    /// no parent (`Ok(None)`). A subdomain whose parent was released, or
+    /// released and registered again, is dead and reports `NameNotFound`.
+    ///
+    /// If the parent's entry has expired (been archived), reading it fails: a
+    /// subdomain cannot be used while its parent is archived.
+    fn live_parent(env: &Env, entry: &NameEntry) -> Result<Option<NameEntry>, NamesError> {
+        let Some(ref parent_hash) = entry.parent else {
+            return Ok(None);
+        };
+        match env
+            .storage()
+            .persistent()
+            .get::<_, NameEntry>(&DataKey::Name(parent_hash.clone()))
+        {
+            Some(parent) if parent.era == entry.era => Ok(Some(parent)),
+            _ => Err(NamesError::NameNotFound),
         }
-        Err(NamesError::NotOwner)
+    }
+
+    /// Whether `name_key` holds a live name (a dead subdomain does not count).
+    fn is_taken(env: &Env, name_key: &DataKey) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, NameEntry>(name_key)
+            .is_some_and(|existing| Self::live_parent(env, &existing).is_ok())
+    }
+
+    /// A new era for a top-level registration. Random rather than a counter so
+    /// that registering does not write instance storage, which every call
+    /// loads. A re-registration repeats a previous era with probability 2^-32,
+    /// and even then the revived subdomains are controlled only by the parent's
+    /// new owner.
+    fn new_era(env: &Env) -> u32 {
+        env.prng().gen::<u64>() as u32
+    }
+
+    /// Remove the reverse entry for `meta` if it still points at `name_hash`.
+    fn clear_reverse(env: &Env, meta: &Bytes, name_hash: &BytesN<32>) {
+        let reverse_key = DataKey::Reverse(BytesN::from_array(
+            env,
+            &env.crypto().sha256(meta).to_array(),
+        ));
+        let points_here = env
+            .storage()
+            .persistent()
+            .get::<_, BytesN<32>>(&reverse_key)
+            .is_some_and(|target| target == *name_hash);
+        if points_here {
+            env.storage().persistent().remove(&reverse_key);
+        }
     }
 
     fn verify_on_behalf_authorization(
@@ -793,13 +858,21 @@ impl WraithNamesContract {
     /// Resolve a name to its stealth meta-address.
     ///
     /// For a subdomain (`payments.alice`) resolution walks to the parent
-    /// (`alice`): if the parent no longer exists the subdomain does not resolve.
+    /// (`alice`): if the parent has been released, or released and registered
+    /// again, the subdomain does not resolve. Resolving a subdomain renews the
+    /// parent's entry too.
     pub fn resolve(env: Env, name: String) -> Result<Bytes, NamesError> {
         let name_hash = Self::hash_name(&env, &name);
         let name_key = DataKey::Name(name_hash);
-        let entry: NameEntry = match env.storage().persistent().get(&name_key) {
-            Some(entry) => entry,
-            None => {
+        let live = env
+            .storage()
+            .persistent()
+            .get::<_, NameEntry>(&name_key)
+            .ok_or(NamesError::NameNotFound)
+            .and_then(|entry| Self::live_parent(&env, &entry).map(|_| entry));
+        let entry = match live {
+            Ok(entry) => entry,
+            Err(err) => {
                 // Emit metric event. Published before the error is returned, so
                 // it is captured whenever the enclosing transaction is applied.
                 emit_metric(
@@ -809,11 +882,14 @@ impl WraithNamesContract {
                     1,
                     Vec::new(&env),
                 );
-                return Err(NamesError::NameNotFound);
+                return Err(err);
             }
         };
 
         Self::extend_ttls(&env, &name_key, None);
+        if let Some(ref parent_hash) = entry.parent {
+            Self::extend_ttls(&env, &DataKey::Name(parent_hash.clone()), None);
+        }
 
         // Emit metric event.
         emit_metric(
@@ -843,6 +919,7 @@ impl WraithNamesContract {
             .persistent()
             .get(&name_key)
             .ok_or(NamesError::NameNotFound)?;
+        Self::live_parent(&env, &entry)?;
 
         Self::extend_ttls(&env, &name_key, Some(&reverse_key));
 
@@ -868,12 +945,13 @@ impl WraithNamesContract {
         let name_hash = Self::hash_name(&env, &name);
         let name_key = DataKey::Name(name_hash.clone());
 
-        // Check if name exists
+        // Check if name exists (a subdomain also needs its live parent)
         let entry: NameEntry = env
             .storage()
             .persistent()
             .get(&name_key)
             .ok_or(NamesError::NameNotFound)?;
+        let parent = Self::live_parent(&env, &entry)?;
 
         // Get the meta-address hash for reverse key
         let meta_hash = BytesN::from_array(
@@ -889,6 +967,10 @@ impl WraithNamesContract {
         env.storage()
             .persistent()
             .extend_ttl(&reverse_key, current_ledger, extend_to_ledger);
+        // A subdomain is only usable while its parent is, so renew both.
+        if let Some(parent) = parent {
+            Self::extend_parent_to(&env, &entry, &parent, current_ledger, extend_to_ledger);
+        }
         env.storage()
             .instance()
             .extend_ttl(current_ledger, extend_to_ledger);
@@ -919,6 +1001,44 @@ impl WraithNamesContract {
                 .persistent()
                 .extend_ttl(r_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         }
+    }
+
+    /// Extend a subdomain's parent entry (and its reverse entry) to `to`.
+    fn extend_parent_to(env: &Env, entry: &NameEntry, parent: &NameEntry, current: u32, to: u32) {
+        let storage = env.storage().persistent();
+        if let Some(ref parent_hash) = entry.parent {
+            storage.extend_ttl(&DataKey::Name(parent_hash.clone()), current, to);
+        }
+        let reverse_key = DataKey::Reverse(BytesN::from_array(
+            env,
+            &env.crypto().sha256(&parent.stealth_meta_address).to_array(),
+        ));
+        if storage.has(&reverse_key) {
+            storage.extend_ttl(&reverse_key, current, to);
+        }
+    }
+
+    /// The parent label of a validated subdomain (`alice` for `payments.alice`).
+    fn parent_label(env: &Env, name: &String) -> Option<String> {
+        let len = name.len() as usize;
+        let mut buf = [0u8; MAX_NAME_LEN];
+        name.copy_into_slice(&mut buf[..len]);
+        let dot = buf[..len].iter().position(|&c| c == b'.')?;
+        Some(String::from_bytes(env, &buf[dot + 1..len]))
+    }
+
+    /// Build `label.parent`, rejecting results longer than `MAX_NAME_LEN`.
+    fn join_labels(env: &Env, label: &String, parent: &String) -> Result<String, NamesError> {
+        let (label_len, parent_len) = (label.len() as usize, parent.len() as usize);
+        let len = label_len + 1 + parent_len;
+        if len > MAX_NAME_LEN {
+            return Err(NamesError::NameTooLong);
+        }
+        let mut buf = [0u8; MAX_NAME_LEN];
+        label.copy_into_slice(&mut buf[..label_len]);
+        buf[label_len] = b'.';
+        parent.copy_into_slice(&mut buf[label_len + 1..len]);
+        Ok(String::from_bytes(env, &buf[..len]))
     }
 
     /// Hash a name string to BytesN<32> for use as storage key.
@@ -956,7 +1076,9 @@ impl WraithNamesContract {
         message
     }
 
-    /// Validate name: 3-32 chars, lowercase alphanumeric only.
+    /// Validate a name: a top-level label (`alice`) or one subdomain level
+    /// (`payments.alice`). Every label is at least `MIN_LABEL_LEN` lowercase
+    /// alphanumeric characters, and the full name is at most `MAX_NAME_LEN`.
     fn validate_name(_env: &Env, name: &String) -> Result<(), NamesError> {
         let len = name.len() as usize;
 
@@ -970,15 +1092,26 @@ impl WraithNamesContract {
 
         let mut name_buf = [0u8; MAX_NAME_LEN];
         name.copy_into_slice(&mut name_buf[..len]);
+        let name_bytes = &name_buf[..len];
 
-        for i in 0..len {
-            let c = name_buf[i];
+        let mut dots = 0usize;
+        for &c in name_bytes {
             if c == b'.' {
-                continue;
-            }
-            if !(c >= b'a' && c <= b'z') && !(c >= b'0' && c <= b'9') {
+                dots += 1;
+            } else if !c.is_ascii_lowercase() && !c.is_ascii_digit() {
                 return Err(NamesError::InvalidNameCharacter);
             }
+        }
+        if dots > MAX_SUBDOMAIN_DEPTH {
+            return Err(NamesError::NameTooDeep);
+        }
+
+        // Each label on its own, so `x.alice`, `.alice` and `alice.` are rejected.
+        if name_bytes
+            .split(|&c| c == b'.')
+            .any(|label| label.len() < MIN_LABEL_LEN)
+        {
+            return Err(NamesError::NameTooShort);
         }
 
         Ok(())
@@ -1537,7 +1670,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // subdomain flow not wired; enable when register_subdomain lands
     fn test_subdomain_register_and_resolve() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1560,7 +1692,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // subdomain flow not wired; enable when register_subdomain lands
     fn test_subdomain_requires_existing_parent() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1577,7 +1708,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // subdomain flow not wired; enable when register_subdomain lands
     fn test_subdomain_permission_boundary() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1611,7 +1741,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // subdomain flow not wired; enable when register_subdomain lands
     fn test_subdomain_update_and_release_by_parent_owner() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1641,7 +1770,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // subdomain flow not wired; enable when register_subdomain lands
     fn test_subdomain_orphaned_when_parent_released() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1677,6 +1805,370 @@ mod test {
         // Dotted names nested more than one level deep are rejected.
         let result = client.try_register(&owner, &String::from_str(&env, "a.b.alice"), &meta);
         assert_eq!(result, Err(Ok(NamesError::NameTooDeep)));
+    }
+
+    fn subdomain_setup() -> (Env, WraithNamesContractClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+        (env, client, contract_id)
+    }
+
+    fn meta(env: &Env, byte: u8) -> Bytes {
+        Bytes::from_slice(env, &[byte; 64])
+    }
+
+    fn name_key(env: &Env, name: &str) -> DataKey {
+        DataKey::Name(WraithNamesContract::hash_name(
+            env,
+            &String::from_str(env, name),
+        ))
+    }
+
+    #[test]
+    fn test_register_subdomain_entry_point() {
+        let (env, client, _) = subdomain_setup();
+        let owner = Address::generate(&env);
+        let parent = String::from_str(&env, "alice");
+        client.register(&owner, &parent, &meta(&env, 1));
+
+        let label = String::from_str(&env, "payments");
+        client.register_subdomain(&owner, &parent, &label, &meta(&env, 2));
+
+        // The call is authorized by the parent owner.
+        assert_eq!(env.auths()[0].0, owner);
+
+        let sub = String::from_str(&env, "payments.alice");
+        assert_eq!(client.resolve(&sub), meta(&env, 2));
+        assert_eq!(client.name_of(&meta(&env, 2)), sub);
+
+        // Same name, either entry point: it is taken.
+        assert_eq!(
+            client.try_register(&owner, &sub, &meta(&env, 3)),
+            Err(Ok(NamesError::NameTaken))
+        );
+        assert_eq!(
+            client.try_register_subdomain(&owner, &parent, &label, &meta(&env, 3)),
+            Err(Ok(NamesError::NameTaken))
+        );
+    }
+
+    #[test]
+    fn test_register_subdomain_rejections() {
+        let (env, client, _) = subdomain_setup();
+        let owner = Address::generate(&env);
+        let other = Address::generate(&env);
+        let parent = String::from_str(&env, "alice");
+        client.register(&owner, &parent, &meta(&env, 1));
+
+        let try_sub = |caller: &Address, parent: &str, label: &str| {
+            client.try_register_subdomain(
+                caller,
+                &String::from_str(&env, parent),
+                &String::from_str(&env, label),
+                &meta(&env, 2),
+            )
+        };
+
+        assert_eq!(
+            try_sub(&other, "alice", "payments"),
+            Err(Ok(NamesError::NotOwner))
+        );
+        assert_eq!(
+            try_sub(&owner, "nobody", "payments"),
+            Err(Ok(NamesError::ParentNotFound))
+        );
+        assert_eq!(
+            try_sub(&owner, "alice", "ab"),
+            Err(Ok(NamesError::NameTooShort))
+        );
+        assert_eq!(
+            try_sub(&owner, "alice", ""),
+            Err(Ok(NamesError::NameTooShort))
+        );
+        assert_eq!(
+            try_sub(&owner, "alice", "pay.ments"),
+            Err(Ok(NamesError::NameTooDeep))
+        );
+        assert_eq!(
+            try_sub(&owner, "pay.alice", "team"),
+            Err(Ok(NamesError::NameTooDeep))
+        );
+        assert_eq!(
+            try_sub(&owner, "alice", "Pay"),
+            Err(Ok(NamesError::InvalidNameCharacter))
+        );
+        // 26 + 1 + 5 = 32 characters fits; one more does not.
+        assert_eq!(
+            try_sub(&owner, "alice", "abcdefghijklmnopqrstuvwxyz"),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            try_sub(&owner, "alice", "abcdefghijklmnopqrstuvwxyz0"),
+            Err(Ok(NamesError::NameTooLong))
+        );
+    }
+
+    #[test]
+    fn test_subdomain_label_and_name_limits() {
+        let (env, client, _) = subdomain_setup();
+        let owner = Address::generate(&env);
+        client.register(&owner, &String::from_str(&env, "alice"), &meta(&env, 1));
+
+        let try_name =
+            |name: &str| client.try_register(&owner, &String::from_str(&env, name), &meta(&env, 2));
+
+        // Every label must be at least three characters.
+        assert_eq!(try_name("ab.alice"), Err(Ok(NamesError::NameTooShort)));
+        assert_eq!(try_name(".alice"), Err(Ok(NamesError::NameTooShort)));
+        assert_eq!(try_name("alice."), Err(Ok(NamesError::NameTooShort)));
+        assert_eq!(try_name("pay.ab"), Err(Ok(NamesError::NameTooShort)));
+        // One level of nesting at most.
+        assert_eq!(try_name("pay..alice"), Err(Ok(NamesError::NameTooDeep)));
+        // The full name, dot included, is at most 32 characters.
+        assert_eq!(
+            try_name("abcdefghijklmnopqrstuvwxyz0.alice"),
+            Err(Ok(NamesError::NameTooLong))
+        );
+        assert_eq!(try_name("abcdefghijklmnopqrstuvwxyz.alice"), Ok(Ok(())));
+        assert_eq!(try_name("pay.alice"), Ok(Ok(())));
+    }
+
+    #[test]
+    fn test_subdomain_not_revived_when_parent_registered_again() {
+        let (env, client, _) = subdomain_setup();
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        let parent = String::from_str(&env, "alice");
+        let sub = String::from_str(&env, "payments.alice");
+
+        client.register(&first, &parent, &meta(&env, 1));
+        client.register(&first, &sub, &meta(&env, 2));
+        client.release(&first, &parent);
+
+        // Someone else registers the released parent: the old subdomain stays
+        // retired, in both directions, and the previous holder cannot touch it.
+        client.register(&second, &parent, &meta(&env, 3));
+        assert_eq!(client.try_resolve(&sub), Err(Ok(NamesError::NameNotFound)));
+        assert_eq!(
+            client.try_name_of(&meta(&env, 2)),
+            Err(Ok(NamesError::NameNotFound))
+        );
+        assert_eq!(
+            client.try_update(&first, &sub, &meta(&env, 4)),
+            Err(Ok(NamesError::NameNotFound))
+        );
+        assert_eq!(
+            client.try_release(&first, &sub),
+            Err(Ok(NamesError::NameNotFound))
+        );
+
+        // The new parent owner can claim the subdomain name afresh.
+        client.register(&second, &sub, &meta(&env, 5));
+        assert_eq!(client.resolve(&sub), meta(&env, 5));
+        assert_eq!(client.name_of(&meta(&env, 5)), sub);
+        assert_eq!(
+            client.try_name_of(&meta(&env, 2)),
+            Err(Ok(NamesError::NameNotFound))
+        );
+        assert_eq!(
+            client.try_update(&first, &sub, &meta(&env, 4)),
+            Err(Ok(NamesError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn test_same_owner_reregistering_parent_starts_fresh() {
+        let (env, client, _) = subdomain_setup();
+        let owner = Address::generate(&env);
+        let parent = String::from_str(&env, "alice");
+        let sub = String::from_str(&env, "payments.alice");
+
+        client.register(&owner, &parent, &meta(&env, 1));
+        client.register(&owner, &sub, &meta(&env, 2));
+        client.release(&owner, &parent);
+        client.register(&owner, &parent, &meta(&env, 1));
+
+        assert_eq!(client.try_resolve(&sub), Err(Ok(NamesError::NameNotFound)));
+        client.register(&owner, &sub, &meta(&env, 2));
+        assert_eq!(client.resolve(&sub), meta(&env, 2));
+        assert_eq!(client.name_of(&meta(&env, 2)), sub);
+    }
+
+    #[test]
+    fn test_subdomain_control_follows_parent_owner() {
+        let (env, client, contract_id) = subdomain_setup();
+        let old_owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let parent = String::from_str(&env, "alice");
+        let sub = String::from_str(&env, "payments.alice");
+
+        client.register(&old_owner, &parent, &meta(&env, 1));
+        client.register(&old_owner, &sub, &meta(&env, 2));
+
+        // The parent changes hands while its registration stays in place (as a
+        // guardian recovery would). There is no public transfer call yet, so the
+        // test rewrites the owner directly.
+        env.as_contract(&contract_id, || {
+            let key = name_key(&env, "alice");
+            let mut entry: NameEntry = env.storage().persistent().get(&key).unwrap();
+            entry.owner = new_owner.clone();
+            env.storage().persistent().set(&key, &entry);
+        });
+
+        // The subdomain keeps resolving, and only the new parent owner manages it.
+        assert_eq!(client.resolve(&sub), meta(&env, 2));
+        assert_eq!(
+            client.try_update(&old_owner, &sub, &meta(&env, 3)),
+            Err(Ok(NamesError::NotOwner))
+        );
+        assert_eq!(
+            client.try_release(&old_owner, &sub),
+            Err(Ok(NamesError::NotOwner))
+        );
+        assert_eq!(
+            client.try_register(
+                &old_owner,
+                &String::from_str(&env, "team.alice"),
+                &meta(&env, 4)
+            ),
+            Err(Ok(NamesError::NotOwner))
+        );
+
+        client.update(&new_owner, &sub, &meta(&env, 5));
+        assert_eq!(client.resolve(&sub), meta(&env, 5));
+        client.register(
+            &new_owner,
+            &String::from_str(&env, "team.alice"),
+            &meta(&env, 6),
+        );
+        client.release(&new_owner, &sub);
+        assert_eq!(client.try_resolve(&sub), Err(Ok(NamesError::NameNotFound)));
+    }
+
+    #[test]
+    fn test_renewing_subdomain_renews_parent() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        use soroban_sdk::testutils::Ledger as _;
+
+        // `extend_name_ttl` / `bulk_renew` renew entries whose remaining TTL is
+        // below the current ledger sequence, so start past the initial TTL.
+        let env = Env::default();
+        env.mock_all_auths();
+        let seq = TTL_EXTEND_TO + 10_000;
+        env.ledger().with_mut(|li| {
+            li.sequence_number = seq;
+            li.max_entry_ttl = 1_000_000;
+        });
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        for (i, parent) in ["alice", "bob", "carol"].into_iter().enumerate() {
+            let i = i as u8 * 2;
+            client.register(&owner, &String::from_str(&env, parent), &meta(&env, i + 1));
+            let sub = format!("pay.{parent}");
+            client.register(&owner, &String::from_str(&env, &sub), &meta(&env, i + 2));
+        }
+        let ttl = |name: &str| {
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().get_ttl(&name_key(&env, name))
+            })
+        };
+
+        client.extend_name_ttl(&String::from_str(&env, "pay.alice"), &(seq + 1_000));
+        assert_eq!(ttl("pay.alice"), seq + 1_000);
+        assert_eq!(ttl("alice"), seq + 1_000);
+
+        let mut names = Vec::new(&env);
+        names.push_back(String::from_str(&env, "pay.bob"));
+        client.bulk_renew(&names, &(seq + 2_000));
+        assert_eq!(ttl("pay.bob"), seq + 2_000);
+        assert_eq!(ttl("bob"), seq + 2_000);
+
+        // Renewing a parent alone leaves its subdomains as they were.
+        client.extend_name_ttl(&String::from_str(&env, "carol"), &(seq + 3_000));
+        assert_eq!(ttl("carol"), seq + 3_000);
+        assert_eq!(ttl("pay.carol"), TTL_EXTEND_TO);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Storage, InternalError)")]
+    fn test_subdomain_unusable_while_parent_archived() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        let (env, client, contract_id) = subdomain_setup();
+        let owner = Address::generate(&env);
+        client.register(&owner, &String::from_str(&env, "alice"), &meta(&env, 1));
+        let sub = String::from_str(&env, "payments.alice");
+        client.register(&owner, &sub, &meta(&env, 2));
+
+        // Keep the instance and the subdomain's own entry live, but let the
+        // parent's entry expire and be archived.
+        let far = TTL_EXTEND_TO * 2;
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(far, far);
+            env.storage()
+                .persistent()
+                .extend_ttl(&name_key(&env, "payments.alice"), far, far);
+        });
+        env.ledger()
+            .with_mut(|li| li.sequence_number += TTL_EXTEND_TO + 1);
+
+        // Reading the subdomain needs its archived parent, so it cannot succeed
+        // until the parent is restored (on a real network the transaction is
+        // rejected before the contract runs).
+        let _ = client.try_resolve(&sub);
+    }
+
+    #[test]
+    fn test_orphaned_subdomain_cannot_be_renewed() {
+        let (env, client, _) = subdomain_setup();
+        let owner = Address::generate(&env);
+        let parent = String::from_str(&env, "alice");
+        let sub = String::from_str(&env, "payments.alice");
+        client.register(&owner, &parent, &meta(&env, 1));
+        client.register(&owner, &sub, &meta(&env, 2));
+        client.release(&owner, &parent);
+
+        let to = env.ledger().sequence() + 1_000;
+        assert_eq!(
+            client.try_extend_name_ttl(&sub, &to),
+            Err(Ok(NamesError::NameNotFound))
+        );
+        let mut names = Vec::new(&env);
+        names.push_back(sub);
+        assert_eq!(
+            client.try_bulk_renew(&names, &to),
+            Err(Ok(NamesError::NameNotFound))
+        );
+    }
+
+    #[test]
+    fn test_bulk_register_parent_and_subdomain() {
+        let (env, client, _) = subdomain_setup();
+        let owner = Address::generate(&env);
+        let mut names = Vec::new(&env);
+        names.push_back(String::from_str(&env, "alice"));
+        names.push_back(String::from_str(&env, "pay.alice"));
+        let mut metas = Vec::new(&env);
+        metas.push_back(meta(&env, 1));
+        metas.push_back(meta(&env, 2));
+
+        client.bulk_register(&owner, &names, &metas);
+        assert_eq!(
+            client.resolve(&String::from_str(&env, "pay.alice")),
+            meta(&env, 2)
+        );
+
+        // A retired subdomain does not block bulk registration under a new parent
+        // registration.
+        client.release(&owner, &String::from_str(&env, "alice"));
+        client.bulk_register(&owner, &names, &metas);
+        assert_eq!(
+            client.resolve(&String::from_str(&env, "pay.alice")),
+            meta(&env, 2)
+        );
     }
 
     #[test]

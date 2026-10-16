@@ -7,6 +7,17 @@
   - **Reason**: Scales with number of registered names; must survive contract upgrades
   - **TTL**: Extended on each access (resolve, update, release)
   
+- **Subdomains**: `NameEntry.parent` holds the parent's name hash and
+  `NameEntry.era` ties a subdomain to one registration of that parent. Every
+  top-level registration draws a random 32-bit era; a subdomain stores its
+  parent's and is live only while the two match. Releasing a parent therefore
+  retires all of its subdomains without iterating over them: their entries are
+  no longer renewed and expire, and registering the same subdomain name again
+  replaces the dead entry (and its stale reverse lookup).
+  - **Why not a counter**: a counter would live in instance storage, which
+    every call loads and which `register` would then rewrite; the era costs
+    20 bytes per entry and no extra ledger entries.
+
 - **Reverse Lookup (Meta-Address Hash → Name Hash)**: Maps stealth meta-address hash to name hash
   - **Reason**: Lookup data that scales with registry size; durable
   - **TTL**: Extended alongside name entry

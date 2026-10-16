@@ -132,6 +132,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "era"
+                      },
+                      "val": {
+                        "u32": 856241466
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "name"
                       },
                       "val": {

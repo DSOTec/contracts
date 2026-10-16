@@ -157,7 +157,7 @@
   },
   {
     "function_v0": {
-      "doc": "Resolve a name to its stealth meta-address.\\n\\nFor a subdomain (`payments.alice`) resolution walks to the parent\\n(`alice`): if the parent no longer exists the subdomain does not resolve.",
+      "doc": "Resolve a name to its stealth meta-address.\\n\\nFor a subdomain (`payments.alice`) resolution walks to the parent\\n(`alice`): if the parent has been released, or released and registered\\nagain, the subdomain does not resolve. Resolving a subdomain renews the\\nparent's entry too.",
       "name": "resolve",
       "inputs": [
         {
@@ -595,6 +595,11 @@
       "lib": "",
       "name": "NameEntry",
       "fields": [
+        {
+          "doc": "Identifies one registration of a top-level name: a random 32-bit value\\ndrawn each time the name is registered. A subdomain records the era of\\nthe parent registration it was created under and is live only while the\\nparent still carries it, so releasing (or releasing and re-registering)\\na parent retires every subdomain created under it.\\n\\nKept to a short key and a `u32` because every entry stores it.",
+          "name": "era",
+          "type_": "u32"
+        },
         {
           "doc": "",
           "name": "name",
@@ -1302,6 +1307,50 @@
           "doc": "",
           "name": "expiry",
           "type_": "u64"
+        }
+      ],
+      "outputs": [
+        {
+          "result": {
+            "ok_type": {
+              "tuple": {
+                "value_types": []
+              }
+            },
+            "error_type": {
+              "udt": {
+                "name": "NamesError"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "function_v0": {
+      "doc": "Register the subdomain `label.parent` (e.g. `payments` under `alice` is\\n`payments.alice`), equivalent to `register(owner, \"label.parent\", ..)`.\\n\\n`parent` must be a live top-level name and `owner` its current owner.\\n`label` follows the usual label rules (3+ lowercase alphanumeric\\ncharacters) and the full name must fit in 32 characters. The subdomain\\nis managed by whoever owns `parent` from then on, and is retired when\\n`parent` is released.",
+      "name": "register_subdomain",
+      "inputs": [
+        {
+          "doc": "",
+          "name": "owner",
+          "type_": "address"
+        },
+        {
+          "doc": "",
+          "name": "parent",
+          "type_": "string"
+        },
+        {
+          "doc": "",
+          "name": "label",
+          "type_": "string"
+        },
+        {
+          "doc": "",
+          "name": "stealth_meta_address",
+          "type_": "bytes"
         }
       ],
       "outputs": [
